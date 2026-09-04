@@ -1,1 +1,1 @@
-# pyside6-webbluetooth
+# Pyside6-webbluetooth
