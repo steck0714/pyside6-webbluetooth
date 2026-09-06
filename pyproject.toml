@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyside6-webbluetooth"
+version = "0.0.0"
+description = "A Web Bluetooth API implementation for PySide6/QtWebEngine apps, backed by bleak."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "steck0714" }]
+requires-python = ">=3.9"
+keywords = [
+    "pyside6",
+    "qtwebengine",
+    "web-bluetooth",
+    "bluetooth",
+    "ble",
+    "bleak",
+    "qwebchannel",
+    "mock-webbluetooth",
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+]
+dependencies = ["PySide6>=6.6", "bleak>=0.21"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Homepage = "https://github.com/steck0714/pyside6-webbluetooth"
+Repository = "https://github.com/steck0714/pyside6-webbluetooth"
+Changelog = "https://github.com/steck0714/pyside6-webbluetooth/blob/main/CHANGELOG.md"
+"Mock-APIs (parent project)" = "https://github.com/steck0714/Mock-APIs"
+"mock-webbluetooth (framework)" = "https://github.com/steck0714/Mock-webbluetooth"
+"Sibling project: Pyside6-webusb" = "https://github.com/steck0714/Pyside6-webusb"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
