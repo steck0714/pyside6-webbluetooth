@@ -124,6 +124,27 @@ def _call_and_wait(signal, action, timeout_ms: int = 3000):
     return sync_result, payload
 
 
+def _wait_until(predicate, timeout: float = 2.0, interval_ms: int = 20) -> None:
+    """`predicate()`がTrueになるまで、Qtのイベントループを短い間隔で
+    回しながら待つ。fire-and-forgetな操作(disconnectGatt()等)の後、
+    バックグラウンドスレッド側の後始末が実際に反映されるのを
+    ポーリングで確認するために使う(固定時間のsleepだと、短すぎれば
+    フレーキーに、長すぎればテストが無駄に遅くなる)。"""
+    import time
+
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    deadline = time.monotonic() + timeout
+    loop = QEventLoop()
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        QTimer.singleShot(interval_ms, loop.quit)
+        loop.exec()
+    if not predicate():
+        raise AssertionError(f"condition not met within {timeout}s")
+
+
 class TestOriginVerification:
     def test_unverified_frame_token_rejected(self, bridge):
         result = json.loads(bridge.getDevices("not-a-real-token"))
@@ -310,7 +331,12 @@ class TestFullGattFlowWithMockedClient:
             r = json.loads(bridge.disconnectGatt("dev1", token))
             assert r["ok"] is True
 
-        assert not bridge._worker.is_connected("dev1")
+        # disconnectGatt()は仕様通りfire-and-forget(実際の切断処理は
+        # ワーカースレッド上で非同期に進む)なので、即座にis_connected()を
+        # 見ると偽陽性(まだTrueのまま)になり得ることがビルド作業などで
+        # マシン負荷が高いときに実際に顕在化した。ここは短時間ポーリングして
+        # 確実に切断が反映されるのを待ってから確認する。
+        _wait_until(lambda: not bridge._worker.is_connected("dev1"), timeout=2.0)
 
     def test_read_after_disconnect_is_network_error(self, qapp, bridge):
         origin = "https://a.example"
@@ -327,7 +353,7 @@ class TestIsAvailable:
         result = json.loads(bridge.isAvailable())
         assert result["ok"] is True
         assert result["result"]["package"] == "pyside6-webbluetooth"
-        assert result["result"]["version"] == "0.0.0"
+        assert result["result"]["version"] == "0.0.0a1"
 
 
 class TestRequestDeviceChooserFlow:
@@ -418,3 +444,106 @@ class TestRequestDeviceChooserFlow:
         result = json.loads(bridge.requestDeviceChooser(options_json, token))
         assert result["ok"] is False
         assert result["error"]["name"] == "SecurityError"
+
+
+class TestDuplicateConnectAndInFlightCancellation:
+    """v0.0.0aで見つけた2つのバグの回帰テスト:
+    1. 接続済みデバイスへの再connect()が新しいBleakClientを作ってしまい、
+       古い接続がリークする。
+    2. デバイス切断時に、そのデバイスに対して進行中だった操作
+       (getPrimaryServices等)がNetworkErrorとして確定されない
+       (仕様の"GATTServer connect-checking wrapper"に相当する処理が無かった)。
+    """
+
+    def test_connect_when_already_connected_does_not_create_second_client(self, qapp, bridge):
+        origin = "https://a.example"
+        _seed_grant(bridge, origin, "dev1", "AA:AA:AA:AA:AA:AA", [BATTERY_UUID])
+        token = _inject_token(bridge, origin)
+
+        construction_count = {"n": 0}
+
+        def factory(address, disconnected_callback=None, **kwargs):
+            construction_count["n"] += 1
+            fake = MagicMock()
+            fake.connect = AsyncMock(return_value=None)
+            fake.is_connected = True
+            return fake
+
+        with patch("pyside6_webbluetooth.ble_worker.BleakClient", side_effect=factory):
+            _, payload1 = _call_and_wait(
+                bridge.bleOperationResult, lambda: json.loads(bridge.connectGatt("dev1", token))
+            )
+            assert payload1["ok"] is True
+            assert construction_count["n"] == 1
+
+            # 既に接続済みの状態でもう一度connect()する
+            sync_r2, payload2 = _call_and_wait(
+                bridge.bleOperationResult, lambda: json.loads(bridge.connectGatt("dev1", token))
+            )
+            assert sync_r2["ok"] is True
+            assert payload2["ok"] is True
+            assert payload2["result"] == {"deviceId": "dev1"}
+            # 2回目はBleakClientを新しく作っていないこと(接続のリーク防止)
+            assert construction_count["n"] == 1
+
+    def test_in_flight_operation_fails_with_network_error_on_disconnect(self, qapp, bridge):
+        """`_dispatch_async`にdevice_idを紐づけて登録した操作は、その
+        デバイスが(裏側の処理の完了を待たずに)切断された時点で即座に
+        NetworkErrorとして確定し、後から裏側の処理が実際に完了しても
+        二重に配送されないことを検証する。
+
+        実際のbleak呼び出しを遅延させる代わりに、`concurrent.futures.Future`
+        を手動で制御することで「操作が進行中の状態」を直接再現している
+        (getPrimaryServices等の入り口を経由しても、最終的には
+        _dispatch_asyncの中の同じ仕組みを検証することになるため、
+        これは実装の詳細に依存しない検証になっている)。
+        """
+        from concurrent.futures import Future
+
+        device_id = "dev1"
+        manual_future: Future = Future()
+        request_id = "req-in-flight-1"
+
+        bridge._dispatch_async(manual_future, request_id, device_id=device_id)
+        assert request_id in bridge._pending_by_device.get(device_id, set())
+
+        with _SignalWaiter(bridge.bleOperationResult) as waiter:
+            bridge._on_device_disconnected(device_id)
+            payload = waiter.wait()
+
+        assert payload["requestId"] == request_id
+        assert payload["ok"] is False
+        assert payload["error"]["name"] == "NetworkError"
+        assert device_id not in bridge._pending_by_device
+
+        # 切断"後"に、裏側の処理が実際には成功していたとしても、
+        # 同じrequestIdに対して二度目の配送は起きない。
+        received_after = []
+        bridge.bleOperationResult.connect(lambda p: received_after.append(json.loads(p)))
+        manual_future.set_result("this should be ignored")
+
+        from PySide6.QtCore import QEventLoop, QTimer
+
+        loop = QEventLoop()
+        QTimer.singleShot(300, loop.quit)
+        loop.exec()
+        assert not any(p.get("requestId") == request_id for p in received_after)
+
+    def test_explicit_disconnect_also_cancels_in_flight_operations(self, qapp, bridge):
+        origin = "https://a.example"
+        _seed_grant(bridge, origin, "dev1", "AA:AA:AA:AA:AA:AA", [BATTERY_UUID])
+        token = _inject_token(bridge, origin)
+
+        from concurrent.futures import Future
+
+        manual_future: Future = Future()
+        request_id = "req-in-flight-2"
+        bridge._dispatch_async(manual_future, request_id, device_id="dev1")
+
+        with _SignalWaiter(bridge.bleOperationResult) as waiter:
+            json.loads(bridge.disconnectGatt("dev1", token))
+            payload = waiter.wait()
+
+        assert payload["requestId"] == request_id
+        assert payload["ok"] is False
+        assert payload["error"]["name"] == "NetworkError"

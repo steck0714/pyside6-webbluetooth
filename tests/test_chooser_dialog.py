@@ -134,3 +134,35 @@ class TestChooserDialogOriginDisplay:
             assert not any("<script>evil</script>" in t for t in texts)
         finally:
             dlg.reject()
+
+
+class TestChooserDialogRobustness:
+    def test_malformed_advertisement_from_one_device_does_not_break_others(self, qapp, battery_filter_options):
+        """近くの実デバイスが規格外の広告データ(serviceDataのキーが
+        UUIDとして解釈できない等)を送ってきても、他の(正しくマッチする)
+        デバイスの一覧表示やダイアログ自体を壊さないことを確認する。"""
+
+        fake_worker = MagicMock()
+        good_adv = _FakeAdv("GoodDevice", [BATTERY_UUID], -50)
+        good_adv.service_data = {BATTERY_UUID: b"\x64"}
+        bad_adv = _FakeAdv("BadDevice", [BATTERY_UUID], -40)
+        bad_adv.service_data = {"not-a-valid-uuid": b"\x01"}  # canonical_uuid()がValueErrorを送出する
+        fake_worker.snapshot_scan_results.return_value = {
+            "AA:AA:AA:AA:AA:AA": (_FakeBLEDevice("AA:AA:AA:AA:AA:AA", "GoodDevice"), good_adv),
+            "BB:BB:BB:BB:BB:BB": (_FakeBLEDevice("BB:BB:BB:BB:BB:BB", "BadDevice"), bad_adv),
+        }
+        # serviceDataでのフィルタでなければcanonical_uuid()に到達しないため、
+        # filterにserviceDataを含めて確実に例外経路を通す
+        from pyside6_webbluetooth import hardening
+
+        options = hardening.validate_request_options(
+            {"filters": [{"services": ["battery_service"], "serviceData": [{"service": "battery_service"}]}]}
+        )
+        dlg = BluetoothDeviceChooserDialog(origin="https://example.com", options=options, worker=fake_worker)
+        try:
+            dlg._poll_scan_results()  # 例外を送出せず完了すること
+            addresses = [dlg._list_widget.item(i).data(Qt.UserRole) for i in range(dlg._list_widget.count())]
+            assert "AA:AA:AA:AA:AA:AA" in addresses
+            assert "BB:BB:BB:BB:BB:BB" not in addresses
+        finally:
+            dlg.reject()

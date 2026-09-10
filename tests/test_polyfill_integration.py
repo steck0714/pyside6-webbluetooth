@@ -334,3 +334,46 @@ class TestNotifyDeliveryThroughRealJs:
 
             log = harness.eval_sync("JSON.stringify(window.__notifyLog)")
             assert json.loads(log) == [72]
+
+
+class TestQtBluetoothBackendSelection:
+    """install(page, backend="qtbluetooth")が実際にQtBluetoothWorkerを
+    使い、navigator.bluetooth経由でも(getAvailability()を通じて)
+    最後まで正しく動くことを確認する。GATTフロー自体の検証は
+    test_qt_ble_worker.pyで行っているので、ここではバックエンド選択の
+    配線そのものだけを対象にする。"""
+
+    def test_qtbluetooth_backend_wired_through_navigator_bluetooth(self, qapp, monkeypatch):
+        import uuid as _uuid
+
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+
+        settings_org = f"pyside6-webbluetooth-test-{_uuid.uuid4().hex}"
+        monkeypatch.setattr(
+            "pyside6_webbluetooth.bridge.QSettings",
+            lambda *a, **k: QSettings(settings_org, "GrantedDevices"),
+        )
+
+        page = QWebEnginePage(QWebEngineProfile.defaultProfile())
+        bridge = install(page, backend="qtbluetooth")
+        try:
+            assert type(bridge._worker).__name__ == "QtBluetoothWorker"
+
+            harness = _JsPageHarness.__new__(_JsPageHarness)
+            harness.qapp = qapp
+            harness.page = page
+            harness.bridge = bridge
+            harness._settings_org = settings_org
+            harness._loaded_box = {}
+            page.loadFinished.connect(lambda ok: harness._loaded_box.__setitem__("ok", ok))
+            page.setUrl(QUrl("https://example.com/"))
+            harness._pump(1000)
+
+            result = harness.eval_async("navigator.bluetooth.getAvailability()")
+            assert result == {"ok": True, "value": False}
+        finally:
+            bridge.shutdown()
+            from PySide6.QtCore import QSettings as _QSettings
+
+            _QSettings(settings_org, "GrantedDevices").clear()
