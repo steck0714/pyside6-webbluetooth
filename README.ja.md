@@ -1,40 +1,45 @@
 # pyside6-webbluetooth
 
-🇯🇵 [日本語](README.ja.md) | 🇺🇸 [English](README.en.md) | 🇨🇳 [简体中文](README.zh.md)
+🇯🇵 日本語 | 🇺🇸 [English](README.en.md) | 🇨🇳 [简体中文](README.zh.md)
 
-⚠️ **v0.0.0 (初版 / Pre-Alpha)**
+⚠️ **v0.0.0a1 (Pre-Alpha / Experimental)**
 
-PySide6 / QtWebEngineベースのアプリに **Web Bluetooth API** (`navigator.bluetooth`) を追加するライブラリです。実際のBLE通信は [bleak](https://github.com/hbldh/bleak) が担当し、本パッケージはブラウザ側のAPI仕様、権限モデル、セキュリティ境界を実装します。
+**PySide6 / QtWebEngine** アプリケーションに **Web Bluetooth API (`navigator.bluetooth`)** を追加するライブラリです。実際のBLE通信は [bleak](https://github.com/hbldh/bleak) が担当し、本パッケージはブラウザ側のAPIサーフェス、権限モデル、GATTアクセス制御、セキュリティ境界を実装します。
 
-[steck0714/Mock-APIs](https://github.com/steck0714/Mock-APIs) の「既存の実APIや標準仕様を調査・検証し、互換性を維持しながら独自の実装・拡張を行う」というコンセプトのもと、[Mock-webusb](https://github.com/steck0714/Mock-webusb) / [Pyside6-webusb](https://github.com/steck0714/Pyside6-webusb) の姉妹プロジェクトとして、**mock-webbluetooth** 枠組みの最初の実装として作られています。
+[steck0714/Mock-APIs](https://github.com/steck0714/Mock-APIs) の「実在するAPI・標準仕様を調査・検証し、互換性を維持しながら独立実装と拡張を行う」というコンセプトの下で開発されています。[Mock-webusb](https://github.com/steck0714/Mock-webusb) / [Pyside6-webusb](https://github.com/steck0714/Pyside6-webusb) の姉妹プロジェクトであり、**mock-webbluetooth** フレームワークにおける最初の実装です。
 
-> ⚠️ **初版です。** AIの支援を受けて開発されています。本番のセキュリティ境界やハードウェア制御用途として利用する前に、必ずコードを確認してください。
+> ⚠️ **Pre-Alpha版です。** AIの支援を受けて開発されています。本番環境のセキュリティ境界やハードウェア制御を目的として利用する前に、必ずソースコードと対象環境での挙動を確認してください。
 
-## 主な機能
+## Features
 
-- Web Bluetooth API互換の `navigator.bluetooth`
-- BLEデバイスの実機通信
+- Web Bluetooth互換の `navigator.bluetooth`
+- 実BLEデバイスとの通信
 - ネイティブデバイス選択ダイアログ
-- ライブスキャンによるデバイス一覧更新
-- Originごとの永続的なデバイス権限
-- フレーム単位のOrigin検証
-- GATTサービス / Characteristic / Descriptorへのアクセス
+- ライブ更新されるスキャン結果
+- オリジンごとの永続的なデバイス権限
+- フレーム単位のオリジン検証
+- GATT Service / Characteristic / Descriptorへのアクセス
 - GATTブロックリスト
-- `requestDevice()` の主要なフィルタ処理
-- `BluetoothUUID` 相当のUUID名前解決
-- Qt UIをブロックしない非同期BLEワーカー
+- `requestDevice()` の主要なfilter処理
+- `BluetoothUUID` 相当のUUID名解決
+- Qt UIスレッドをブロックしない非同期BLE Worker
 - QtWebEngine / QWebChannelブリッジ
+- `bleak` を使用する標準バックエンド
+- 実験的な `PySide6.QtBluetooth` (`QLowEnergyController`) バックエンド
 
-## インストール
+## Installation
 
 ```bash
 pip install pyside6-webbluetooth
 ```
 
-依存関係:
+Requirements:
 
+- `Python>=3.10`
 - `PySide6>=6.6`
 - `bleak>=0.21`
+
+Python 3.14.7 + PySide6 6.11.2 + bleak 3.0.2 の環境でも構築・検証され、テストスイート **117件すべてが成功**しています。
 
 ## Quick Start
 
@@ -55,7 +60,7 @@ app.exec()
 bridge.shutdown()
 ```
 
-ページ側では、Web Bluetooth対応ブラウザと同様に `navigator.bluetooth` を利用できます。
+ページ側のJavaScriptからは、Web Bluetooth対応ブラウザと同じ一般的な書き方で利用できます。
 
 ```javascript
 const device = await navigator.bluetooth.requestDevice({
@@ -70,10 +75,26 @@ const value = await characteristic.readValue();
 console.log('battery:', value.getUint8(0), '%');
 ```
 
-## アーキテクチャ
+## Backend
+
+既定では `bleak` を使用します。
+
+```python
+bridge = install(view.page())
+```
+
+実験的にPySide6同梱の `PySide6.QtBluetooth` / `QLowEnergyController` を使用することもできます。
+
+```python
+bridge = install(view.page(), backend="qtbluetooth")
+```
+
+QtBluetoothバックエンドでは、接続・GATT探索・read/write/notifyの配線をモックで検証していますが、**実BLEハードウェアでの検証はまだ行われていません**。対象プラットフォームでの実機確認を推奨します。
+
+## Architecture
 
 ```text
-Webページ
+Web page
     │
     │ navigator.bluetooth
     ▼
@@ -83,90 +104,96 @@ JavaScript Web Bluetooth Polyfill
     ▼
 BluetoothBridge
     │
-    ├── Origin / frame検証
-    ├── 権限管理
-    ├── デバイス選択
-    ├── GATTブロックリスト
-    └── API / 引数検証
+    ├── API / argument validation
+    ├── Origin / frame verification
+    ├── Permission management
+    ├── Device chooser
+    └── GATT blocklist
     │
     ▼
 BLE Worker / asyncio
     │
-    │ bleak
+    ├── bleak backend
+    │      or
+    └── QtBluetooth backend
+    │
     ▼
-BLEデバイス
+BLE device
 ```
 
-## なぜ pyside6-webusb と設計が違うのか
+## Why the design differs from pyside6-webusb
 
-[pyside6-webusb](https://github.com/steck0714/Pyside6-webusb) と同じくWeb API互換を目指していますが、Bluetooth LEの性質上、内部設計は同一ではありません。
+[Mock-APIs](https://github.com/steck0714/Mock-APIs) では、単純な移植ではなく対象環境の制約に合わせた独立実装を重視しています。
 
-USBの多くの操作は比較的短時間で完了します。一方、BLEではスキャン、接続、GATT探索などが数百ms〜数秒かかる場合があります。また、`bleak` は `asyncio` ベースです。
+`pyside6-webusb` ではUSB操作を同期的に扱えますが、BLEではスキャン・接続・GATT探索などが数百ms〜数秒かかる場合があります。また `bleak` はasyncioベースです。
 
-そのため本プロジェクトでは:
+そのため本パッケージでは、
 
-- **軽い操作** (`getDevices()`、`forget()`など): 同期処理
-- **デバイス選択** (`requestDevice()`): モーダルダイアログを維持しつつ、専用asyncioスレッドでライブスキャン
-- **BLE操作** (`connect()`、GATT探索、read/write/notify): 検証後すぐ `requestId` を返し、完了結果をQt Signal経由で非同期配送
+- **軽量操作** (`getDevices()`、`forget()`など): 同期処理
+- **`requestDevice()`**: モーダルなネイティブチューザーを表示しながら、専用asyncioスレッドでライブスキャン
+- **BLE操作** (`connect()`、GATT探索、read/write/notify): 同期検証後に `requestId` を返し、完了結果をQt Signalで非同期配送
 
 という構成を採用しています。
 
-これにより、BLE無線操作の待ち時間でQtWebEngineのUIスレッドを長時間ブロックしない設計になっています。
+これにより、BLE無線処理の待ち時間でQtWebEngineのUIスレッドを長時間ブロックすることを避けます。
 
-## セキュリティ設計
+## Security Design
 
-### Originごとの権限
+### Per-origin permissions
 
-`requestDevice()` で選択されたデバイスと許可されたサービスUUIDをOrigin単位で管理し、`QSettings` に永続化します。
+`requestDevice()` で選択したデバイスと、そのオリジンに許可されたサービスUUIDを `QSettings` に保存します。
 
 許可されていないサービスへのアクセスは `SecurityError` として拒否されます。
 
-### フレーム単位のOrigin検証
+### Per-frame origin verification
 
-QWebChannelのブリッジはページ内の複数フレームから参照できるため、JavaScriptが自己申告するOriginをそのまま信用しません。
+QWebChannelで公開されたブリッジはページ内のiframeからも見えるため、JavaScriptが自己申告するorigin文字列をそのまま信用しません。
 
-各フレームへ個別の推測困難なトークンを配布し、Python側でトークンと実際のOriginの対応を追跡します。
+各フレームに推測困難なトークンを配布し、Python側で **token → 実際のorigin** の対応を追跡します。iframeを含む実際の `QWebEnginePage` を使ったテストでも検証されています。
 
-iframeを含む実際の `QWebEnginePage` を使ったテストでも、この境界を検証しています。
+### GATT blocklist
 
-### GATTブロックリスト
+[WebBluetoothCG/registries](https://github.com/WebBluetoothCG/registries/blob/master/gatt_blocklist.txt) のGATT blocklistを実装しています。
 
-WebBluetoothCGのGATT blocklistを実装し、保護対象のサービス・Characteristic・Descriptorへのアクセスを拒否します。
+対象には、HID、ファームウェア更新系、FIDO関連などの保護されたGATTリソースや、特定のプライバシー関連・設定用characteristic/descriptorが含まれます。
 
-HID、ファームウェア更新系、FIDO関連などの保護対象を含みます。
+## Chrome Compatibility
 
-## Chromeとの互換性
+Chrome / ChromiumのWeb Bluetooth挙動とWeb Bluetooth仕様を互換性の基準として参照していますが、**Chrome内部実装の直接移植ではありません**。
 
-Chrome / ChromiumのWeb Bluetooth挙動を互換性の参考にしていますが、このプロジェクトは **Chromeの内部実装をそのまま移植したものではありません**。
+> **Web Bluetooth compatibility ≠ Chrome clone**
 
-> **Web Bluetooth互換 ≠ Chromeクローン**
+APIの使い方は可能な限りWeb Bluetooth互換を目指しつつ、内部実装はPySide6 / QtWebEngine / Python / BLEバックエンドに合わせて独立して構築しています。
 
-APIの互換性を重視しつつ、PySide6 / QtWebEngine / Python / bleakという実行環境に合わせた独立実装になっています。
-
-## 開発・テスト
+## Development & Testing
 
 ```bash
 pip install -e ".[dev]"
 pytest
 ```
 
-テストでは、実際のPySide6 / QtWebEngine環境、オフスクリーンの `QWebEnginePage`、iframe、JavaScript実行、そしてモックした `bleak.BleakClient` を組み合わせて検証しています。
+PySide6 / QtWebEngineの実環境、オフスクリーン `QWebEnginePage`、iframe、JavaScript実行、`bleak.BleakClient` / `QLowEnergyController` のモックを組み合わせてテストしています。
 
-ヘッドレス環境では `tests/conftest.py` が必要に応じて `QT_QPA_PLATFORM=offscreen` にフォールバックします。
+v0.0.0a1では **117 tests passed** が確認されています。
 
-## 既知の制限
+実BLEアダプタがないCI・コンテナ環境では、`tests/conftest.py` が `QT_QPA_PLATFORM=offscreen` へフォールバックできます。
 
-v0.0.0では以下が未実装・制限事項です。
+## Known Limitations
+
+v0.0.0a1時点の主な制限:
 
 - `getIncludedService()` / `getIncludedServices()` は `NotSupportedError`
 - `watchAdvertisements()` / `unwatchAdvertisements()` は未実装
-- Manufacturer Dataの補助的なブロックリストは未実装
-- 通知配送はGATT handleではなく、(device, service)内のCharacteristic UUIDで照合
-- pyside6-webusbにあるRust/C++ネイティブ高速化は未対応
+- Manufacturer Dataの補助的なblocklistは未実装
+- notify/indicateの配送は `(device, service)` 内のcharacteristic UUIDで対応付けており、GATT handleそのものではありません
+- Rust/C++によるネイティブ高速化は未対応
+- `backend="qtbluetooth"` は実BLEハードウェアで未検証
 
-詳細は [`CHANGELOG.md`](CHANGELOG.md) を参照してください。
+また、Web Bluetoothはブラウザ・OS・BLEスタックによる差異が大きいため、実際にハードウェアを制御する用途では対象OS・BLEアダプタでの検証を推奨します。
 
-## 関連プロジェクト
+詳細な変更点、バグ修正、仕様再確認、Python 3.14 / PySide6 6.11での検証結果は [`CHANGELOG.md`](CHANGELOG.md) を参照してください。
+
+## Related Projects
 
 - [Mock-APIs](https://github.com/steck0714/Mock-APIs)
 - [Mock-webusb](https://github.com/steck0714/Mock-webusb)
