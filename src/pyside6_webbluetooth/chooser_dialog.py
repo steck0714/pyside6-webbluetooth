@@ -118,13 +118,22 @@ class BluetoothDeviceChooserDialog(QDialog):
         matched = []
         for address, (device, adv) in results.items():
             local_name = adv.local_name or device.name
-            if hardening.device_matches_options(
-                local_name=local_name,
-                service_uuids=list(adv.service_uuids or []),
-                manufacturer_data=dict(adv.manufacturer_data or {}),
-                service_data=dict(adv.service_data or {}),
-                options=self._options,
-            ):
+            try:
+                is_match = hardening.device_matches_options(
+                    local_name=local_name,
+                    service_uuids=list(adv.service_uuids or []),
+                    manufacturer_data=dict(adv.manufacturer_data or {}),
+                    service_data=dict(adv.service_data or {}),
+                    options=self._options,
+                )
+            except Exception:
+                # 近くの実デバイスが規格に沿わない/想定外の形式の広告データを
+                # 送ってくる可能性は捨てきれない(コードレビューで気づいた)。
+                # そのデバイス1台の照合に失敗しても、他のデバイスの走査や
+                # ダイアログ自体を巻き込んで壊さないよう、ここだけ握りつぶして
+                # 単に候補から除外する。
+                continue
+            if is_match:
                 matched.append((address, local_name, adv.rssi))
 
         # 信号強度が強い順(=近い/繋がりやすい順)に並べる。RSSI未取得はNoneでは

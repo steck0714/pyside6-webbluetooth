@@ -53,9 +53,10 @@ from PySide6.QtWidgets import QDialog
 
 from . import errors, hardening
 from ._version import __version__
-from .ble_worker import BleOperationError, BleWorker, new_client_id
+from .ble_worker import BleOperationError, BleWorker
 from .chooser_dialog import BluetoothDeviceChooserDialog
 from .frame_origin import FrameOriginTracker
+from .future_utils import future_then
 from .gatt_registry import GATT_CHARACTERISTIC_NAMES, GATT_DESCRIPTOR_NAMES, GATT_SERVICE_NAMES, resolve_uuid
 
 
@@ -83,19 +84,44 @@ class BluetoothBridge(QObject):
     # {"deviceId": str} のJSON。
     gattServerDisconnected = Signal(str)
 
-    def __init__(self, page, parent: Optional[QObject] = None) -> None:
+    def __init__(self, page, parent: Optional[QObject] = None, *, backend: str = "bleak") -> None:
         super().__init__(parent)
         self._page = page
         self._frame_tracker = FrameOriginTracker(page)
         self._frame_tracker.start()
-        self._worker = BleWorker()
+        self._worker = self._create_worker(backend)
         self._worker.start()
         self._settings = QSettings("pyside6-webbluetooth", "GrantedDevices")
-        # device_id -> {"origin", "serviceUuid探索用キャッシュ" 等の実行時状態}。
-        # 永続化される権限データ(QSettings)とは別に、実行中のみ必要な
-        # ライブ状態(接続中かどうか等はBleWorker.is_connectedで判定できるため
-        # ここには持たない)をまとめて置く。
-        self._runtime: dict[str, dict[str, Any]] = {}
+        # device_id -> そのデバイスに対して現在実行中(未解決)のrequestIdの集合。
+        # 仕様のGATTServer connect-checking wrapper
+        # (https://webbluetoothcg.github.io/web-bluetooth/ 、
+        # 「gattServer@[[activeAlgorithms]]」)に相当する: あるデバイスが
+        # 切断された時点で、そのデバイスに対して実行中だった操作は
+        # (たとえ裏側のbleak呼び出し自体が後から成功したとしても)
+        # NetworkErrorとして確定させなければならない。実装時のコード
+        # レビューで、この仕組みが無いことに気づいて追加した。
+        self._pending_by_device: dict[str, set[str]] = {}
+
+    @staticmethod
+    def _create_worker(backend: str):
+        """BLEバックエンドを選ぶ。
+
+        - "bleak"(既定): 十分にテストされた、cross-platformに実績のある
+          BleWorker(ble_worker.py)。
+        - "qtbluetooth": PySide6.QtBluetooth(QLowEnergyController)を使う
+          実験的なQtBluetoothWorker(qt_ble_worker.py)。追加の依存
+          (bleak, dbus-fast等)を増やしたくない場合や、Qtへより密に
+          統合したい場合の選択肢として用意した。モックによる配線検証は
+          行っているが、実BLEハードウェアに対する検証はできていない
+          (README.md/CHANGELOG.mdの既知の制限を参照)。
+        """
+        if backend == "bleak":
+            return BleWorker()
+        if backend == "qtbluetooth":
+            from .qt_ble_worker import QtBluetoothWorker
+
+            return QtBluetoothWorker()
+        raise ValueError(f"unknown backend: {backend!r} (expected 'bleak' or 'qtbluetooth')")
 
     # ------------------------------------------------------------------
     # 内部ヘルパー
@@ -141,8 +167,19 @@ class BluetoothBridge(QObject):
             )
         return None
 
-    def _dispatch_async(self, future, request_id: str, serialize=lambda x: x) -> None:
+    def _dispatch_async(self, future, request_id: str, serialize=lambda x: x, device_id: Optional[str] = None) -> None:
+        if device_id is not None:
+            self._pending_by_device.setdefault(device_id, set()).add(request_id)
+
         def on_done(fut) -> None:
+            # このデバイス切断時にすでにキャンセル済み(_fail_pending_for_deviceが
+            # 代わりにNetworkErrorを配送済み)なら、裏側のbleak呼び出しが後から
+            # 何を返してきても二重に配送しない。
+            if device_id is not None:
+                pending = self._pending_by_device.get(device_id)
+                if pending is None or request_id not in pending:
+                    return
+                pending.discard(request_id)
             try:
                 result = fut.result()
                 payload = {"requestId": request_id, "ok": True, "result": serialize(result)}
@@ -162,11 +199,32 @@ class BluetoothBridge(QObject):
 
         future.add_done_callback(on_done)
 
+    def _fail_pending_for_device(self, device_id: str, message: str) -> None:
+        """仕様の「GATTServer connect-checking wrapper」(gattServerが実行中に
+        切断された場合、そのgattServerに紐づく進行中のアルゴリズムはすべて
+        NetworkErrorとして確定させる)に相当する処理。切断がユーザーの
+        明示的なdisconnect()によるものか、デバイス側からの予期しない
+        切断かを問わず、切断時点で未解決のrequestIdはすべてここで
+        確定させる。"""
+        pending = self._pending_by_device.pop(device_id, None)
+        if not pending:
+            return
+        for request_id in pending:
+            payload = {
+                "requestId": request_id,
+                "ok": False,
+                "error": errors.make_error("NetworkError", message),
+            }
+            self.bleOperationResult.emit(json.dumps(payload))
+
     @staticmethod
     def _new_request_id() -> str:
         return uuid_module.uuid4().hex
 
     def _on_device_disconnected(self, device_id: str) -> None:
+        self._fail_pending_for_device(
+            device_id, "GATT Server was disconnected while this operation was in progress."
+        )
         self.gattServerDisconnected.emit(json.dumps({"deviceId": device_id}))
 
     def _on_characteristic_notify(
@@ -308,11 +366,24 @@ class BluetoothBridge(QObject):
         if grant is None:
             return json.dumps(errors.security_error(f"No known device with id {device_id} for this origin"))
 
+        if self._worker.is_connected(device_id):
+            # すでに接続済みのGATTサーバーへ再度connect()した場合、仕様上は
+            # 同じサーバーで即座に成功すればよい。ここを素通りしてbleak
+            # (BleakClient)へ新しい接続を張り直すと、古いBleakClient
+            # インスタンスをdisconnect()せずに上書きしてしまい、接続が
+            # リークする(コードレビューで発見。JS側で`connect()`を
+            # 防御的に複数回呼ぶコードは珍しくないため、実害があり得る)。
+            request_id = self._new_request_id()
+            self.bleOperationResult.emit(
+                json.dumps({"requestId": request_id, "ok": True, "result": {"deviceId": device_id}})
+            )
+            return json.dumps(errors.ok({"requestId": request_id}))
+
         request_id = self._new_request_id()
         future = self._worker.connect(
             device_id, grant["address"], on_disconnected=self._on_device_disconnected
         )
-        self._dispatch_async(future, request_id, serialize=lambda _: {"deviceId": device_id})
+        self._dispatch_async(future, request_id, serialize=lambda _: {"deviceId": device_id}, device_id=device_id)
         return json.dumps(errors.ok({"requestId": request_id}))
 
     @Slot(str, str, result=str)
@@ -326,6 +397,11 @@ class BluetoothBridge(QObject):
         grant = self._get_grant(origin, device_id)
         if grant is None:
             return json.dumps(errors.security_error(f"No known device with id {device_id} for this origin"))
+        # 切断時点で進行中だった操作は、後から裏側の処理がどう転んでも
+        # NetworkErrorとして確定させる(仕様のGATTServer
+        # connect-checking wrapperに相当。上のコメント・
+        # _fail_pending_for_deviceの説明を参照)。
+        self._fail_pending_for_device(device_id, "GATT Server disconnected by disconnect().")
         self._worker.disconnect(device_id)
         return json.dumps(errors.ok(None))
 
@@ -397,7 +473,7 @@ class BluetoothBridge(QObject):
 
         request_id = self._new_request_id()
         future = self._worker.get_services(device_id)
-        self._dispatch_async(future, request_id, serialize=serialize)
+        self._dispatch_async(future, request_id, serialize=serialize, device_id=device_id)
         return json.dumps(errors.ok({"requestId": request_id}))
 
     @Slot(str, str, str, str, result=str)
@@ -458,7 +534,7 @@ class BluetoothBridge(QObject):
 
         request_id = self._new_request_id()
         future = self._worker.get_services(device_id)
-        self._dispatch_async(future, request_id, serialize=serialize)
+        self._dispatch_async(future, request_id, serialize=serialize, device_id=device_id)
         return json.dumps(errors.ok({"requestId": request_id}))
 
     @Slot(str, str, str, str, str, result=str)
@@ -525,7 +601,7 @@ class BluetoothBridge(QObject):
 
         request_id = self._new_request_id()
         future = self._worker.get_services(device_id)
-        self._dispatch_async(future, request_id, serialize=serialize)
+        self._dispatch_async(future, request_id, serialize=serialize, device_id=device_id)
         return json.dumps(errors.ok({"requestId": request_id}))
 
     # ------------------------------------------------------------------
@@ -546,8 +622,7 @@ class BluetoothBridge(QObject):
     # 二重にスレッドをまたぐ必要が無いことを利用している。ble_worker.pyと
     # bridge.pyは同一パッケージ内で密結合している前提の設計。
 
-    async def _resolve_characteristic_or_raise(self, device_id: str, service_uuid: str, handle: int) -> dict:
-        services = await self._worker._get_services_async(device_id)
+    def _resolve_characteristic_or_raise(self, services: list, service_uuid: str, handle: int) -> dict:
         svc = next((s for s in services if s["uuid"] == service_uuid), None)
         if svc is None:
             raise BleOperationError(
@@ -561,10 +636,10 @@ class BluetoothBridge(QObject):
             )
         return ch
 
-    async def _resolve_descriptor_or_raise(
-        self, device_id: str, service_uuid: str, characteristic_handle: int, handle: int
+    def _resolve_descriptor_or_raise(
+        self, services: list, service_uuid: str, characteristic_handle: int, handle: int
     ) -> dict:
-        ch = await self._resolve_characteristic_or_raise(device_id, service_uuid, characteristic_handle)
+        ch = self._resolve_characteristic_or_raise(services, service_uuid, characteristic_handle)
         d = next((dd for dd in ch["descriptors"] if dd["handle"] == handle), None)
         if d is None:
             raise BleOperationError(
@@ -572,70 +647,80 @@ class BluetoothBridge(QObject):
             )
         return d
 
-    async def _read_characteristic_flow(self, device_id: str, service_uuid: str, handle: int) -> tuple:
-        ch = await self._resolve_characteristic_or_raise(device_id, service_uuid, handle)
-        if hardening.is_blocked_for_read(ch["uuid"]):
-            raise BleOperationError(
-                f"Reading characteristic {ch['uuid']} is not allowed.", web_bluetooth_error_name="SecurityError"
-            )
-        if "read" not in ch["properties"]:
-            raise BleOperationError(
-                "Characteristic does not support reads.", web_bluetooth_error_name="NotSupportedError"
-            )
-        data = await self._worker._read_characteristic_async(device_id, handle)
-        return ch["uuid"], data
+    def _read_characteristic_flow(self, device_id: str, service_uuid: str, handle: int):
+        def after_services(services):
+            ch = self._resolve_characteristic_or_raise(services, service_uuid, handle)
+            if hardening.is_blocked_for_read(ch["uuid"]):
+                raise BleOperationError(
+                    f"Reading characteristic {ch['uuid']} is not allowed.", web_bluetooth_error_name="SecurityError"
+                )
+            if "read" not in ch["properties"]:
+                raise BleOperationError(
+                    "Characteristic does not support reads.", web_bluetooth_error_name="NotSupportedError"
+                )
+            return future_then(self._worker.read_characteristic(device_id, handle), lambda data: (ch["uuid"], data))
 
-    async def _write_characteristic_flow(
+        return future_then(self._worker.get_services(device_id), after_services)
+
+    def _write_characteristic_flow(
         self, device_id: str, service_uuid: str, handle: int, data: bytes, with_response: bool
-    ) -> str:
-        ch = await self._resolve_characteristic_or_raise(device_id, service_uuid, handle)
-        if hardening.is_blocked_for_write(ch["uuid"]):
-            raise BleOperationError(
-                f"Writing characteristic {ch['uuid']} is not allowed.", web_bluetooth_error_name="SecurityError"
+    ):
+        def after_services(services):
+            ch = self._resolve_characteristic_or_raise(services, service_uuid, handle)
+            if hardening.is_blocked_for_write(ch["uuid"]):
+                raise BleOperationError(
+                    f"Writing characteristic {ch['uuid']} is not allowed.", web_bluetooth_error_name="SecurityError"
+                )
+            required_prop = "write" if with_response else "write-without-response"
+            if required_prop not in ch["properties"]:
+                raise BleOperationError(
+                    f"Characteristic does not support {required_prop}.", web_bluetooth_error_name="NotSupportedError"
+                )
+            return future_then(
+                self._worker.write_characteristic(device_id, handle, data, with_response), lambda _: ch["uuid"]
             )
-        required_prop = "write" if with_response else "write-without-response"
-        if required_prop not in ch["properties"]:
-            raise BleOperationError(
-                f"Characteristic does not support {required_prop}.", web_bluetooth_error_name="NotSupportedError"
-            )
-        await self._worker._write_characteristic_async(device_id, handle, data, with_response)
-        return ch["uuid"]
 
-    async def _read_descriptor_flow(
-        self, device_id: str, service_uuid: str, characteristic_handle: int, handle: int
-    ) -> tuple:
-        d = await self._resolve_descriptor_or_raise(device_id, service_uuid, characteristic_handle, handle)
-        if hardening.is_blocked_for_read(d["uuid"]):
-            raise BleOperationError(
-                f"Reading descriptor {d['uuid']} is not allowed.", web_bluetooth_error_name="SecurityError"
-            )
-        data = await self._worker._read_descriptor_async(device_id, handle)
-        return d["uuid"], data
+        return future_then(self._worker.get_services(device_id), after_services)
 
-    async def _write_descriptor_flow(
+    def _read_descriptor_flow(self, device_id: str, service_uuid: str, characteristic_handle: int, handle: int):
+        def after_services(services):
+            d = self._resolve_descriptor_or_raise(services, service_uuid, characteristic_handle, handle)
+            if hardening.is_blocked_for_read(d["uuid"]):
+                raise BleOperationError(
+                    f"Reading descriptor {d['uuid']} is not allowed.", web_bluetooth_error_name="SecurityError"
+                )
+            return future_then(self._worker.read_descriptor(device_id, handle), lambda data: (d["uuid"], data))
+
+        return future_then(self._worker.get_services(device_id), after_services)
+
+    def _write_descriptor_flow(
         self, device_id: str, service_uuid: str, characteristic_handle: int, handle: int, data: bytes
-    ) -> str:
-        d = await self._resolve_descriptor_or_raise(device_id, service_uuid, characteristic_handle, handle)
-        if hardening.is_blocked_for_write(d["uuid"]):
-            raise BleOperationError(
-                f"Writing descriptor {d['uuid']} is not allowed.", web_bluetooth_error_name="SecurityError"
-            )
-        await self._worker._write_descriptor_async(device_id, handle, data)
-        return d["uuid"]
+    ):
+        def after_services(services):
+            d = self._resolve_descriptor_or_raise(services, service_uuid, characteristic_handle, handle)
+            if hardening.is_blocked_for_write(d["uuid"]):
+                raise BleOperationError(
+                    f"Writing descriptor {d['uuid']} is not allowed.", web_bluetooth_error_name="SecurityError"
+                )
+            return future_then(self._worker.write_descriptor(device_id, handle, data), lambda _: d["uuid"])
 
-    async def _start_notify_flow(self, device_id: str, service_uuid: str, handle: int) -> str:
-        ch = await self._resolve_characteristic_or_raise(device_id, service_uuid, handle)
-        if "notify" not in ch["properties"] and "indicate" not in ch["properties"]:
-            raise BleOperationError(
-                "Characteristic does not support notifications.", web_bluetooth_error_name="NotSupportedError"
-            )
-        char_uuid = ch["uuid"]
+        return future_then(self._worker.get_services(device_id), after_services)
 
-        def on_value(_sender_uuid: str, data: bytes) -> None:
-            self._on_characteristic_notify(device_id, service_uuid, char_uuid, _sender_uuid, data)
+    def _start_notify_flow(self, device_id: str, service_uuid: str, handle: int):
+        def after_services(services):
+            ch = self._resolve_characteristic_or_raise(services, service_uuid, handle)
+            if "notify" not in ch["properties"] and "indicate" not in ch["properties"]:
+                raise BleOperationError(
+                    "Characteristic does not support notifications.", web_bluetooth_error_name="NotSupportedError"
+                )
+            char_uuid = ch["uuid"]
 
-        await self._worker._start_notify_async(device_id, handle, on_value)
-        return char_uuid
+            def on_value(_sender_uuid: str, data: bytes) -> None:
+                self._on_characteristic_notify(device_id, service_uuid, char_uuid, _sender_uuid, data)
+
+            return future_then(self._worker.start_notify(device_id, handle, on_value), lambda _: char_uuid)
+
+        return future_then(self._worker.get_services(device_id), after_services)
 
     @Slot(str, str, str, str, result=str)
     def readCharacteristicValue(self, device_id: str, service_uuid: str, handle_json: str, frame_token: str) -> str:
@@ -656,8 +741,8 @@ class BluetoothBridge(QObject):
             return json.dumps(errors.type_error("invalid characteristic handle"))
 
         request_id = self._new_request_id()
-        future = self._worker.submit(self._read_characteristic_flow(device_id, service_uuid, handle))
-        self._dispatch_async(future, request_id, serialize=lambda pair: {"value": _b64encode(pair[1])})
+        future = self._read_characteristic_flow(device_id, service_uuid, handle)
+        self._dispatch_async(future, request_id, serialize=lambda pair: {"value": _b64encode(pair[1])}, device_id=device_id)
         return json.dumps(errors.ok({"requestId": request_id}))
 
     @Slot(str, str, str, str, bool, str, result=str)
@@ -688,10 +773,8 @@ class BluetoothBridge(QObject):
             return json.dumps(errors.type_error("invalid characteristic handle or data"))
 
         request_id = self._new_request_id()
-        future = self._worker.submit(
-            self._write_characteristic_flow(device_id, service_uuid, handle, data, with_response)
-        )
-        self._dispatch_async(future, request_id, serialize=lambda _uuid: None)
+        future = self._write_characteristic_flow(device_id, service_uuid, handle, data, with_response)
+        self._dispatch_async(future, request_id, serialize=lambda _uuid: None, device_id=device_id)
         return json.dumps(errors.ok({"requestId": request_id}))
 
     @Slot(str, str, str, str, str, result=str)
@@ -716,10 +799,8 @@ class BluetoothBridge(QObject):
             return json.dumps(errors.type_error("invalid handle"))
 
         request_id = self._new_request_id()
-        future = self._worker.submit(
-            self._read_descriptor_flow(device_id, service_uuid, characteristic_handle, handle)
-        )
-        self._dispatch_async(future, request_id, serialize=lambda pair: {"value": _b64encode(pair[1])})
+        future = self._read_descriptor_flow(device_id, service_uuid, characteristic_handle, handle)
+        self._dispatch_async(future, request_id, serialize=lambda pair: {"value": _b64encode(pair[1])}, device_id=device_id)
         return json.dumps(errors.ok({"requestId": request_id}))
 
     @Slot(str, str, str, str, str, str, result=str)
@@ -751,10 +832,8 @@ class BluetoothBridge(QObject):
             return json.dumps(errors.type_error("invalid handle or data"))
 
         request_id = self._new_request_id()
-        future = self._worker.submit(
-            self._write_descriptor_flow(device_id, service_uuid, characteristic_handle, handle, data)
-        )
-        self._dispatch_async(future, request_id, serialize=lambda _uuid: None)
+        future = self._write_descriptor_flow(device_id, service_uuid, characteristic_handle, handle, data)
+        self._dispatch_async(future, request_id, serialize=lambda _uuid: None, device_id=device_id)
         return json.dumps(errors.ok({"requestId": request_id}))
 
     @Slot(str, str, str, str, result=str)
@@ -776,8 +855,8 @@ class BluetoothBridge(QObject):
             return json.dumps(errors.type_error("invalid characteristic handle"))
 
         request_id = self._new_request_id()
-        future = self._worker.submit(self._start_notify_flow(device_id, service_uuid, handle))
-        self._dispatch_async(future, request_id, serialize=lambda _uuid: None)
+        future = self._start_notify_flow(device_id, service_uuid, handle)
+        self._dispatch_async(future, request_id, serialize=lambda _uuid: None, device_id=device_id)
         return json.dumps(errors.ok({"requestId": request_id}))
 
     @Slot(str, str, str, str, result=str)
@@ -795,5 +874,5 @@ class BluetoothBridge(QObject):
 
         request_id = self._new_request_id()
         future = self._worker.stop_notify(device_id, handle)
-        self._dispatch_async(future, request_id, serialize=lambda _: None)
+        self._dispatch_async(future, request_id, serialize=lambda _: None, device_id=device_id)
         return json.dumps(errors.ok({"requestId": request_id}))

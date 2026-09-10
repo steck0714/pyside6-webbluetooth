@@ -192,9 +192,22 @@ _POLYFILL_JS_TEMPLATE = r'''
       });
     }
 
+    function clearNotifyTargetsForDevice(deviceId) {
+      var prefix = deviceId + '|';
+      Array.from(_notifyTargets.keys()).forEach(function (key) {
+        if (key.indexOf(prefix) === 0) _notifyTargets.delete(key);
+      });
+    }
+
     function onGattServerDisconnected(payloadJson) {
       var payload = JSON.parse(payloadJson);
       var device = _deviceRegistry.get(payload.deviceId);
+      // 再接続時にhandleが変わり得るため、切断済みデバイスに紐づく
+      // notify登録は掃除しておく(そうしないと再接続後に古い特性
+      // オブジェクトが_notifyTargetsに残り続け、メモリリークと、
+      // 同じUUIDの新しい特性オブジェクトと重複して通知を受け取る
+      // 原因になる。コードレビューで気づいた)。
+      clearNotifyTargetsForDevice(payload.deviceId);
       if (!device) return;
       device.gatt.connected = false;
       device.dispatchEvent(new Event('gattserverdisconnected'));
@@ -499,6 +512,7 @@ _POLYFILL_JS_TEMPLATE = r'''
       callBridge('disconnectGatt', [this.device.id, frameToken()]).catch(function (e) {
         console.warn('[pyside6-webbluetooth] disconnect() failed:', e);
       });
+      clearNotifyTargetsForDevice(this.device.id);
       this.connected = false;
     };
 
@@ -623,12 +637,18 @@ def _build_polyfill_js(object_name: str) -> str:
     return _POLYFILL_JS_TEMPLATE.replace("__OBJECT_NAME__", object_name)
 
 
-def install(page, *, object_name: str = "pyBluetoothBridge"):
+def install(page, *, object_name: str = "pyBluetoothBridge", backend: str = "bleak"):
     """指定したQWebEnginePageに navigator.bluetooth を導入する。
 
     ページで読み込まれるすべてのフレーム(トップページ本体、および
     その中のiframe)のドキュメント生成時点で、QWebChannelのセットアップと
     navigator.bluetoothの定義が自動的に走るようになる。
+
+    `backend`: "bleak"(既定、十分にテスト済み)または
+    "qtbluetooth"(PySide6.QtBluetoothを使う実験的な代替。追加の依存
+    (bleak/dbus-fast等)を増やしたくない場合や、Qtへより密に統合したい
+    場合向け。実BLEハードウェアに対する検証はまだ限定的 -- README.md /
+    CHANGELOG.mdを参照)。
 
     戻り値は生成された`BluetoothBridge`(bridge.py)。呼び出し側は
     アプリケーション終了時に`bridge.shutdown()`を呼ぶこと
@@ -638,7 +658,7 @@ def install(page, *, object_name: str = "pyBluetoothBridge"):
 
     from .bridge import BluetoothBridge
 
-    bridge = BluetoothBridge(page, parent=page)
+    bridge = BluetoothBridge(page, parent=page, backend=backend)
     channel = QWebChannel(page)
     channel.registerObject(object_name, bridge)
     page.setWebChannel(channel)

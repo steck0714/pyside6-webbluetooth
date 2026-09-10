@@ -9,4 +9,4 @@ __init__.py から逆に import しようとすると循環importになる。両
 
 姉妹プロジェクト pyside6-webusb と同じ構成。"""
 
-__version__ = "0.0.0"
+__version__ = "0.0.0a1"

@@ -141,16 +141,34 @@ class FrameOriginTracker:
 
     def rescan(self) -> None:
         """現在のフレーム木を歩き、各フレームへ新しいトークンを配布する。"""
-        main_frame = self._page.mainFrame()
+        try:
+            main_frame = self._page.mainFrame()
+        except Exception:
+            # アプリ終了処理中などでpage自体が破棄されかけている場合に
+            # 備える。QTimerは明示的にstop()するまで発火し続けるため、
+            # ここで例外を投げるとタイマーのコールバック連鎖を壊しうる。
+            return
         if main_frame is None:
             return
         self._prune_expired()
         self._visit(main_frame)
 
     def _visit(self, frame: "QWebEngineFrame") -> None:
-        if frame is None or not frame.isValid():
+        try:
+            if frame is None or not frame.isValid():
+                return
+            origin = derive_origin(frame.url())
+            children = list(frame.children())
+        except Exception:
+            # Qtのドキュメントにある通り、フレームは自発的に生成・破棄され
+            # 得る("may be created and deleted spontaneously")。
+            # isValid()の直後であっても、その後の.url()/.children()呼び出しが
+            # 完全に安全である保証は無いため、ここで打ち切っても
+            # rescan()全体やQTimerの周期処理を壊さないようにする
+            # (次の周期でやり直せば済む話であり、フェイルクローズの
+            # 原則にも反しない)。
             return
-        origin = derive_origin(frame.url())
+
         if origin is not None:
             token = secrets.token_urlsafe(32)
             self._tokens[token] = (origin, time.monotonic())
@@ -167,7 +185,7 @@ class FrameOriginTracker:
         # 不透明オリジンのフレーム(about:/data:等)には何も注入しない。
         # window.__pyside6WebBluetoothFrameToken は未定義のままとなり、
         # そのフレームからのブリッジ呼び出しはPython側で必ず拒否される。
-        for child in frame.children():
+        for child in children:
             self._visit(child)
 
     def _prune_expired(self) -> None:
